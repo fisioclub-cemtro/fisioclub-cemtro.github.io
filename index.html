@@ -266,32 +266,47 @@ function pickMime(){var c=['video/mp4;codecs=avc1.42E01E,mp4a.40.2','video/mp4;c
  for(var i=0;i<c.length;i++)if(MediaRecorder.isTypeSupported&&MediaRecorder.isTypeSupported(c[i]))return c[i];return ''}
 function canTranscode(){return !!(window.MediaRecorder&&HTMLCanvasElement.prototype.captureStream)}
 function transcode(f,onp){return new Promise(function(res,rej){
- var v=document.createElement('video'),ac=null,done=false,url=URL.createObjectURL(f);
- v.playsInline=true;v.setAttribute('playsinline','');v.preload='auto';v.src=url;v.style.cssText='position:fixed;left:0;top:0;width:2px;height:2px;opacity:0;pointer-events:none';document.body.appendChild(v);
- function clean(){try{v.pause();v.remove();URL.revokeObjectURL(url);if(ac)ac.close()}catch(e){}}
- v.onerror=function(){clean();rej(new Error('Este navegador no puede leer el vídeo. Prueba a subirlo desde otro móvil u ordenador.'))};
+ var v=document.createElement('video'),ac=null,done=false,settled=false,url=URL.createObjectURL(f),rec=null,chunks=[],mime='',wd=null,hard=null,lastT=-1,lastMove=Date.now();
+ v.playsInline=true;v.setAttribute('playsinline','');v.preload='auto';v.src=url;v.style.cssText='position:fixed;left:0;top:0;width:2px;height:2px;opacity:0.01;pointer-events:none';document.body.appendChild(v);
+ function clean(){clearInterval(wd);clearTimeout(hard);try{v.pause();v.remove();URL.revokeObjectURL(url);if(ac)ac.close()}catch(e){}}
+ function ok(){if(settled)return;settled=true;clean();var t=((rec&&rec.mimeType)||mime||'video/webm').split(';')[0]||'video/webm';res(new File(chunks,'video.'+(t.indexOf('mp4')>-1?'mp4':'webm'),{type:t}))}
+ function fail(m){if(settled)return;settled=true;try{if(rec&&rec.state!=='inactive')rec.stop()}catch(e){}clean();rej(new Error(m))}
+ function finish(){if(done)return;done=true;onp(1);
+  try{if(rec&&rec.state!=='inactive'){rec.requestData&&rec.requestData();rec.stop()}else ok()}catch(e){ok()}
+  setTimeout(ok,4000)} // por si Safari no avisa de que ha terminado de grabar
+ v.onerror=function(){fail('Este navegador no puede leer el vídeo.')};
  v.onloadedmetadata=async function(){
-  if(v.duration>300){clean();rej(new Error('El vídeo dura más de 5 minutos. Graba un clip más corto.'));return}
+  var dur=v.duration;if(!isFinite(dur)||dur<=0)dur=60;
+  if(dur>300){fail('El vídeo dura más de 5 minutos. Graba un clip más corto.');return}
   var W=v.videoWidth||1280,H=v.videoHeight||720,k=Math.min(1,1280/Math.max(W,H)),cw=Math.round(W*k/2)*2,ch=Math.round(H*k/2)*2;
   var cv=document.createElement('canvas');cv.width=cw;cv.height=ch;var cx=cv.getContext('2d'),st=cv.captureStream(30);
   try{ac=new(window.AudioContext||window.webkitAudioContext)();var sn=ac.createMediaElementSource(v),ds=ac.createMediaStreamDestination();sn.connect(ds);ds.stream.getAudioTracks().forEach(function(t){st.addTrack(t)});ac.resume&&ac.resume()}catch(e){ac=null}
-  var mime=pickMime(),o={videoBitsPerSecond:2200000,audioBitsPerSecond:96000};if(mime)o.mimeType=mime;
-  var rec,chunks=[];try{rec=new MediaRecorder(st,o)}catch(e){clean();rej(e);return}
+  mime=pickMime();var o={videoBitsPerSecond:2200000,audioBitsPerSecond:96000};if(mime)o.mimeType=mime;
+  try{rec=new MediaRecorder(st,o)}catch(e){fail('No se pudo procesar el vídeo.');return}
   rec.ondataavailable=function(e){if(e.data&&e.data.size)chunks.push(e.data)};
-  rec.onstop=function(){clean();var t=((rec.mimeType||mime||'video/webm').split(';')[0])||'video/webm';res(new File(chunks,'video.'+(t.indexOf('mp4')>-1?'mp4':'webm'),{type:t}))};
-  function frame(){if(done)return;try{cx.drawImage(v,0,0,cw,ch)}catch(e){}onp(v.duration?Math.min(.99,v.currentTime/v.duration):0);
+  rec.onstop=function(){ok()};
+  function frame(){if(done)return;try{cx.drawImage(v,0,0,cw,ch)}catch(e){}onp(Math.min(.99,v.currentTime/dur));
    if(v.requestVideoFrameCallback)v.requestVideoFrameCallback(frame);else setTimeout(frame,33)}
-  v.onended=function(){if(done)return;done=true;setTimeout(function(){rec.state!=='inactive'&&rec.stop()},200)};
+  v.onended=finish;
+  // vigilante: detecta el final aunque Safari no lance "ended", y los atascos
+  wd=setInterval(function(){if(done)return;var t=v.currentTime;
+   if(v.ended||t>=dur-0.3){finish();return}
+   if(t!==lastT){lastT=t;lastMove=Date.now();return}
+   if(Date.now()-lastMove>4000){if(t>=dur*0.9)finish();else fail('El procesado del vídeo se ha atascado.')}},500);
+  hard=setTimeout(function(){if(!done){if(v.currentTime>=dur*0.9)finish();else fail('El procesado del vídeo ha tardado demasiado.')}},dur*2500+20000);
   rec.start(1000);
-  try{await v.play()}catch(e){try{v.muted=true;await v.play()}catch(e2){clean();rej(new Error('No se pudo procesar el vídeo. Inténtalo otra vez.'));return}}
+  try{await v.play()}catch(e){try{v.muted=true;await v.play()}catch(e2){fail('No se pudo procesar el vídeo.');return}}
   frame()}})}
 async function prepVideo(f,id){var mov=/quicktime/i.test(f.type)||/\.(mov|hevc)$/i.test(f.name);
  if(!mov&&f.size<=40*MB)return f;
- if(!canTranscode()){if(f.size<=MAXUP)return f;throw new Error('El vídeo pesa '+Math.round(f.size/MB)+' MB y este navegador no puede reducirlo. Graba un clip más corto (máximo 50 MB).')}
+ var orig=function(why){if(f.size<=MAXUP){toast(why+' Se sube el vídeo original.');return f}
+  throw new Error(why+' Además pesa '+Math.round(f.size/MB)+' MB (máximo 50 MB): graba un clip más corto.')};
+ if(!canTranscode())return orig('Este navegador no puede optimizar vídeos.');
  upSt(id,'Optimizando vídeo… 0%. No cierres esta pantalla.');
- var out=await transcode(f,function(x){upSt(id,'Optimizando vídeo… '+Math.round(x*100)+'%. No cierres esta pantalla.')});
- if(out.size<1000)throw new Error('No se pudo optimizar el vídeo. Inténtalo de nuevo.');
- if(out.size>MAXUP)throw new Error('Incluso optimizado pesa más de 50 MB. Graba un clip más corto.');
+ var out;try{out=await transcode(f,function(x){upSt(id,'Optimizando vídeo… '+Math.round(x*100)+'%. No cierres esta pantalla.')})}
+ catch(e){return orig('No se pudo optimizar el vídeo.')}
+ if(!out||out.size<1000)return orig('No se pudo optimizar el vídeo.');
+ if(out.size>MAXUP)return orig('El vídeo optimizado sigue siendo muy grande.');
  return out.size<f.size||mov?out:f}
 async function xhrUpload(path,file,onp){var s=chk(await sb.auth.getSession()).session;if(!s)throw new Error('Tu sesión ha caducado. Vuelve a entrar.');
  return new Promise(function(res,rej){var x=new XMLHttpRequest();x.open('POST',CFG.url.replace(/\/$/,'')+'/storage/v1/object/videos/'+path);
